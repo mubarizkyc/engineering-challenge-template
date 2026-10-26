@@ -4,239 +4,222 @@ A Rust binary that streams the full Polymarket CLOB order book (every live
 symbol, redundant websockets, per-replica books) and writes snapshots plus
 deltas to an aligned SBE file.
 
----
-## Project
+Overview. `main.rs` parses CLI, sets up tracing, dispatches.
+`collector.rs` wires the writer, engine, and supervisor together and owns
+shutdown ordering. `supervisor.rs` handles discovery, sharding, and the
+lifecycle of connection tasks. `connection.rs` is one websocket task , it
+connects, keepalives, recycles, and backs off. `polymarket.rs` does Gamma
+discovery and CLOB decoding. `engine.rs` is the per-symbol state machine:
+source selection, health checks, snapshot cadence. `output.rs` is a
+dedicated writer thread. `dump.rs` reads the SBE file back and verifies it.
 
-### Structure
-
-```
-src/
-  main.rs        — CLI, tracing, dispatch
-  collector.rs   — wires writer + engine + supervisor, owns shutdown order
-  supervisor.rs  — discovery, sharding, connection lifecycle
-  connection.rs  — one websocket task: connect, keepalive, recycle, backoff
-  polymarket.rs  — Gamma discovery + CLOB decoder
-  engine.rs      — per-symbol source selection, health, snapshots
-  output.rs      — dedicated writer thread (AlignedSbeWriter)
-  dump.rs        — offline replay + verification
-  util/          — SBE types, aligned writer/reader, DTOs
-```
-
-`main`, `dump`, `output` are scaffolding. The real work is in `supervisor`,
-`connection`, `polymarket`, `engine`.
+The four modules that matter are `supervisor`, `connection`, `polymarket`,
+`engine`. The rest is scaffolding.
 
 ### Redundant websockets
 
-I wanted the system to keep producing if any single socket died, without a
-central coordinator.
+Each shard is up to 200 symbols, carried by N independent connections.
+Every connection owns its own `OrderBookManager`. we are using one book per connection
+My first instinct was a single shared manager, with
+all sockets writing into it. That looked simpler. But it meant every apply
+had cross-socket lock contention, and any desync on one socket poisoned the
+book every other socket was reading from. 
 
-- Each shard is up to 200 symbols, carried by N independent connections.
-- **Each connection owns its own `OrderBookManager`.** This was the biggest
-  decision — sharing one manager across all sockets was my first instinct,
-  but it meant every apply had cross-socket lock contention, and a desync on
-  one socket poisoned the shared book. Separate books was ~40 lines more
-  wiring and removed a whole class of bug.
-- One replica is the **source**; its deltas are written, others stay hot but
-  silent. Picking the source: eligible → fresh → low-latency → recent. On
-  switch, emit a snapshot from the new source's book, because they may
-  differ.
+One replica per symbol is the *source* — only its deltas go to output.
+The others stay fully synced in the background, When the source switches, we write a fresh snapshot
+from the new source's own book, because the two replicas' books may have
+drifted and the consumer needs an anchor.
 
 ### Subscription monitoring
 
-The hard part wasn't detecting failure — it was detecting failure *without
-false positives*. My first version desynced on every locked book (bid ==
-ask) because I trusted polyfill's `is_valid()`, which uses strict `<`. That
-was the whole reason my desync counters kept spiking in early runs. Fixing
-it required writing my own `is_crossed` (strict `>`) and remembering to use
-it everywhere.
+My first version desynced on every locked book — bid equal
+to ask — because I trusted polyfill's `is_valid()`, which uses strict
+`best_bid < best_ask`. Locked books happen constantly in binary markets
+during tight consensus. I spent hours chasing phantom desyncs before I
+noticed the semantics. Fixing it meant writing my own `is_crossed` with
+strict `>` and remembering to use it in every check.
 
-What the health check actually does every 1s:
-
-- Never-synced replica → retry after `resync_timeout`.
-- Replica silent while siblings active → desync + resubscribe at 60s.
-- All replicas quiet for far longer than that symbol's usual gap → rotate
-  one replica to probe (never the source while another exists).
-- Latency reselect: only if a sibling is 2s faster, with 30s hysteresis.
-- `resubscribe_backoff` prevents tight loops — a desync sets
-  `resubscribe_pending`, and the actual command only fires once backoff
-  elapsed.
+The health check runs every second. For each replica it asks: has this
+replica ever synced? If not, and `resync_timeout` has passed, resubscribe.
+If it has synced but has gone silent while its sibling is still receiving
+deltas, desync it and resubscribe once `replica_silence` has elapsed. There
+is a per-symbol `mean_gap` — an EWMA of the gaps between source deltas — so
+quiet symbols can be probed on their own schedule instead of a fixed
+timeout; when every replica has been quiet for far longer than that symbol
+usually is, we rotate one replica (never the source, while another exists)
+to check the market is really idle. Latency reselection only fires if a
+sibling is 2 seconds faster, with a 30-second hysteresis, and
+`resubscribe_backoff` prevents tight loops by holding a resubscribe until
+its cooldown has expired.
 
 ### polymarket_client_sdk_v2
 
-Only used for discovery. `GammaClient::events()` with
-`active/closed/limit/offset` — nothing else.
+The official Polymarket Rust SDK. I use exactly one surface of it:
+`GammaClient::events()` with an `EventsRequest` for paginated discovery
+against `gamma-api.polymarket.com/events`. Nothing else — no CLOB access,
+no order submission, no credentials.
 
-**The filter is the fix.** `enable_order_book && accepting_orders &&
-!closed && (liquidity > 0 || volume > 0)`. That last clause is why
-`covered == symbols` holds. Polymarket serves "ghost" markets with zero
-liquidity and zero volume; the WS feed never sends them a snapshot, so
-subscribing left them permanently uncovered. Excluding them at discovery
-removed the problem — dropped symbol count from ~4140 to ~2372, and
-`uncovered` from 2 to 0.
-
-**422 is not an error.** Gamma caps offset pagination with a 422 saying "use
-/events/keyset." My first version treated it as failure, which set
-`complete = false`, which meant removals never fired, which meant closed
-markets stayed subscribed forever. The fix is one branch: on 422, `break`
-and leave `complete = true`.
+The filter is the important part. A market has to have `enable_order_book`
+true, `accepting_orders` true, `closed` false, and — the clause that
+actually made the system work — **liquidity or volume greater than zero**.
+Polymarket serves many ghost markets with zero liquidity and zero volume;
+but we dont subscibe
 
 ### polyfill-rs
 
-High-performance book library. Fixed-point ticks (`Price = u32` at
-1/10,000), sharded `RwLock<HashMap<..>>`, sorted `Vec` per side so
-top-of-book is `levels[0]`.
+A high-performance order book library that handles everything on the hot
+path. Fixed-point integers internally: `Price` is a `u32` in ticks at
+1/10,000 of the base unit, `Qty` is an `i64` in units at 1/10,000. The
+`OrderBookManager` is sharded into 64 `RwLock<HashMap<String, OrderBook>>`
+partitions, so writes to different symbols rarely contend. Inside each
+book, `BookSide` is a sorted `Vec<(Price, StoredLevel)>` with binary-search
+insertion — bids highest-first, asks lowest-first, so top-of-book is
+always `levels[0]`.
 
-How I use it:
+Snapshots go through `apply_book_update`. It validates the entire snapshot
+before mutating anything, so a malformed level leaves the existing book
+untouched. It replaces both sides atomically using generation counters.
+It rejects stale-timestamp replays and orders same-timestamp distinct-hash
+states by arrival.
 
-- **Snapshots** → `apply_book_update(&BookUpdate)`. Validates everything
-  before mutating; replaces both sides atomically via generation counters.
-- **Deltas** → `with_book_mut(symbol, |b| { for e in batch {
-  b.apply_delta(...)?; } Ok(..) })`. One lock per asset-batch, not per
-  entry. `size == 0` removes. Rejects stale sequences — I feed a monotonic
-  counter per decoder, since Polymarket has no usable sequence.
-- **Reads** → `bids_fast` / `asks_fast` / `best_bid_fast` /
-  `best_ask_fast` return fixed-point structs — no `Decimal` allocation, no
-  re-sort, straight from the sorted vector.
+Deltas go through `with_book_mut(symbol, |b| b.apply_delta(...))`. One lock
+per asset-batch, not per entry. `size == 0` removes the level. It rejects
+stale sequences — I feed it a monotonic counter per decoder, because
+Polymarket has no usable server-side sequence. Reads for emission use
+`bids_fast` and `asks_fast`, which return `Vec<FastBookLevel>` directly
+from the sorted vector — no `Decimal` allocation, no re-sort. Top-of-book
+checks use `best_bid_fast` and `best_ask_fast`, which are O(1) reads of
+`levels[0]`.
 
-Why it matters: `~5ns` per operation versus `~100ns` for a Decimal-based
-book. The wins are integer compares vs `Decimal::Ord`, sorted `Vec` vs
-`BTreeMap` (top-of-book cache-local), and generation-based snapshot
-replacement (no full scan to clear stale levels).
+The performance character is roughly five nanoseconds per operation versus
+a hundred for a Decimal-based book — twenty-odd times faster on the hot
+path, zero per-message allocation. The wins come from integer comparisons
+instead of `Decimal::Ord`, a sorted `Vec` instead of a `BTreeMap` so
+top-of-book stays cache-local, and generation-based snapshot replacement so
+clearing stale levels doesn't require a scan.
 
-Not used: `set_tick_size` (Polymarket prices are always 4-decimal exact —
-`decimal_to_price_exact` already rejects garbage). `BookAnalytics` (no
-metrics surface yet).
+I don't use `set_tick_size` — Polymarket prices are always exactly
+four-decimal-representable and `decimal_to_price_exact` already rejects
+anything that isn't. I don't use `BookAnalytics` — there's no metrics
+surface yet.
 
-### Shortcomings — honest list
+### Generic decode/encode — attempted, then removed
 
-**I built a generic decoder first, then tore it out.** I wrote a `Decoder`
-trait with associated error/book types, thinking "second exchange someday."
-In practice the trait had one implementor and 30 lines of `where` clauses.
-It obscured the actual Polymarket logic behind an abstraction for a future
-that hasn't arrived. I spent a full session confused by my own API before
-deleting it. The current `PolymarketDecoder` is concrete, half the size,
-twice as legible. **Premature abstraction was my biggest waste of time.**
+I built a generic `Decoder` trait first, with associated error and book
+types, thinking about a hypothetical second exchange.
+I spent a whole session confused by my own API before
+deleting it. The current decoder is concrete —
+`pub fn decode(&mut self, text: &str, out: &mut Vec<Event>)` — with no
+generic parameters and no associated types. If a second exchange lands, the
+abstraction can come back with two real implementors to design against.
 
-**I trusted the library's validator.** `polyfill::OrderBook::is_valid()` uses
-strict `<`, so locked books (`bid == ask`) return false. Locked books happen
-constantly in binary markets during tight consensus. I spent hours chasing
-phantom desyncs before noticing the semantics. Fixing this — writing my own
-`is_crossed` with strict `>` — was the single highest-impact fix in the
-whole project. **Read the library's docs; don't assume a method named
-"is_valid" means what you think it means.**
+### Shortcomings
 
-**I over-trusted exchange-reported TOB.** My first decoder desynced when
-the exchange's `best_bid`/`best_ask` on a `price_change` didn't match my
-post-delta book. Structurally wrong: the exchange samples TOB at a
-different moment than we apply the batch. This caused a false-desync storm
-on every reconnect. The fix is to log mismatch at `debug!` and never
-desync on it — the book we built is authoritative.
+I trust the library's `is_valid()` and didn't. That's the first one. It
+uses strict `best_bid < best_ask`, so locked books read as invalid, and
+locked books are normal in binary markets. I spent hours chasing phantom
+desyncs before I noticed. The lesson: read the semantics, don't assume a
+method named "is_valid" means what you think it means.
 
-**Thresholds were tuned wrong.** `latency_switch_ms = 50` caused a
-1,100-switch-per-window storm because 50ms of EWMA jitter is noise, not
-signal. `idle_timeout = 30s` caused reconnect churn on quiet symbols.
-`resubscribe_backoff = 10s` caused retries before the exchange had a chance
-to send anything. Each was a small number that felt safe and wasn't.
+I trusted the exchange's reported top-of-book. My first decoder desynced
+when the exchange's `best_bid` and `best_ask` on a `price_change` didn't
+match my post-delta book. Structurally wrong — the exchange samples TOB at
+a different moment than we apply the batch. This caused a false-desync
+storm on every reconnect. The fix is to log mismatch at `debug!` and never
+desync on it. The book we built is authoritative.
 
-**No tests.** I have `dump --quiet` as a file-level check, but no unit
-tests for the engine, no decoder tests, no integration tests for the
-writer. My confidence in correctness comes from logs, not from asserted
-behaviour. **This is the biggest gap between my submission and a
-production-grade one.**
-
-### What's actually special
-
-Three things, in order of how much they mattered:
-
-1. **Per-connection books.** Removes cross-socket contention, isolates
-   desyncs, makes source-switch clean (each replica has its own consistent
-   view). Costs ~40 lines more wiring; eliminates a whole bug class.
-2. **Deterministic snapshot spreading.** FNV-1a hash of symbol % slots
-   phases each symbol's periodic snapshot. A 2,400-symbol set becomes ~10
-   snapshots per 250ms tick instead of 2,400 at one boundary. Costs nothing
-   at write time.
-3. **Shutdown-time proof.** `EngineStats.updates_written` must equal
-   `WriterStats.updates`; same for snapshots. If they don't, a message was
-   lost between engine and writer. Two counter equalities prove the whole
-   pipeline at process exit.
+I tuned the thresholds wrong. `latency_switch_ms = 50` caused a
+1,100-switch-per-window storm because fifty milliseconds of EWMA jitter is
+noise, not signal. `idle_timeout = 30s` caused reconnect churn on quiet
+symbols. `resubscribe_backoff = 10s` retried before the exchange had a
+chance to send anything. Each was a small number that felt safe and wasn't.
+Current values are `latency_switch_ms = 2000`, `min_switch_interval = 30s`,
+`replica_silence = 60s`.
 
 ### Latency and throughput
 
-- polyfill fixed-point book → no `Decimal` allocation on the delta path.
-- Batch lock per asset in the decoder → one `with_book_mut`, not one per
-  entry.
-- Snapshot spreading → no writer-queue burst on the 60s boundary.
-- Aligned SBE writer thread → 64 MiB buffer, one `write` syscall per minute
-  at steady state. Off-runtime so disk I/O never blocks a socket read.
-- EWMA latency per connection, used only for source reselection, never on
-  the hot path.
-- Threshold discipline: `latency_switch_ms = 2000`, `min_switch_interval =
-  30s`, `replica_silence = 60s`. All tuned down from what felt right after
-  watching the switch-storm logs.
+The polyfill fixed-point book means no `Decimal` allocation on the delta
+path. Batching the lock per asset in the decoder means one `with_book_mut`
+per asset-batch, not one per entry. The snapshot spreading eliminates the
+writer-queue burst at each 60s boundary. The aligned SBE writer thread
+keeps a 64 MiB buffer and issues one `write` syscall per minute at steady
+state — encoding and disk I/O happen off-runtime, so a slow disk can never
+block a socket read. Every connection carries its own latency EWMA, used
+only for source reselection and never for hot-path decisions. Thresholds
+are tuned for a data collector rather than a trader, which is why
+`latency_switch_ms` is two seconds and not fifty milliseconds.
 
 ### Polymarket module
 
-`Polymarket` — discovery + WS entry. `new()`, `discover()` (paginated
-`/events` → `{symbols, complete}`), `fetch_events_page(offset)`,
-`decoder()` (fresh `PolymarketDecoder` with a fresh `OrderBookManager`),
-`connect_request()`.
+`Polymarket` is discovery plus the WS entry point. `new()` builds one
+`GammaClient` and stores the WS URL. `discover()` paginates `/events`,
+dedupes tokens, and returns `{symbols, complete}`. `fetch_events_page`
+makes one SDK call, applies the filter, and extracts `clob_token_ids`.
+`decoder()` creates a fresh `PolymarketDecoder` with a fresh
+`OrderBookManager`. `connect_request()` builds the WS `Request`.
 
-`PolymarketDecoder` — per-connection WS decoder. State: `books: Arc<
-OrderBookManager>`, `synced: HashSet<String>`, `sequence: u64`.
+`PolymarketDecoder` is the per-connection WS decoder. It holds an
+`Arc<OrderBookManager>`, a `HashSet<String>` of synced symbols, and a
+monotonic `sequence: u64`. `handle_book` is where the reconnect-reset
+happens: on the first snapshot for a symbol on this connection it resets
+the book's `last_snapshot_timestamp_ms`, `last_delta_sequence`, and
+`sequence` to zero so a reconnect can reload the same symbol. Then it calls
+`apply_book_update`, then verifies two things — that
+`last_snapshot_timestamp_ms` is nonzero (the update actually landed, not
+silently rejected) and that the book is not crossed. On success it marks
+the symbol synced and emits a `Snapshot`; on any failure it removes the
+symbol from `synced` and emits a `Desync` for the engine to handle.
 
-- `handle_book`: on first snapshot for a symbol on this connection, reset
-  the book's stale-check guards (`last_snapshot_timestamp_ms`,
-  `last_delta_sequence`, `sequence`) so a reconnect can reload the same
-  symbol. `apply_book_update`. Verify `loaded_ts != 0` (update actually
-  landed, not silently rejected) and not crossed. On success: mark synced,
-  emit Snapshot. On any failure: remove from synced, emit Desync.
-- `handle_price_change`: group by asset (one message can carry YES and NO).
-  Skip unsynced. Skip if `pc_msg.timestamp < last_snapshot_timestamp_ms`
-  (would double-count). One `with_book_mut` per asset — apply all entries,
-  then read crossed state and TOB. Emit Delta per entry. TOB mismatch is
-  `debug!` only.
-- `is_crossed` — strict `>`. Locked is normal in binary markets and is not
-  corruption.
+`handle_price_change` groups entries by asset first, because one
+`price_change` message can carry both the YES and NO sides of a market.
+Then for each asset it skips if not synced, skips if the message timestamp
+predates the snapshot (would double-count), takes one `with_book_mut` lock,
+applies every entry for that asset, and reads back the crossed state and
+top-of-book. It emits one `Delta` per entry, with the entry's own TOB. The
+comparison against the exchange's reported TOB is `debug!` only — the book
+we built is authoritative and the exchange samples at a different moment.
+
+`is_crossed` is my helper, not polyfill's — strict `best_bid > best_ask`.
+Locked is normal and is not corruption.
 
 ### Engine module
 
-`Engine` — per-symbol state machine.
+`Engine` is the per-symbol state machine. It holds four maps: per-connection
+books, per-symbol state (replicas, source, activity/gap EWMAs, timing),
+per-connection state (up flag, latency EWMA, command sender), and cumulative
+stats.
 
-State: `books_by_conn`, `symbols` (per-symbol replicas, source, activity/
-gap EWMAs), `conns` (up, latency EWMA, command sender), `stats`.
+`handle` dispatches the messages. `ConnUp` marks the connection up and
+marks every replica on it as unsynced, because a fresh connection implies
+a fresh subscription. `ConnDown` marks the connection down, drops replica
+sync, and reselects any source that was on it — but it does not drop the
+book `Arc`, because the connection reuses it on reconnect. `Register`
+stores the book manager and command sender. `AddSymbols` creates
+`SymbolState` and caches the FNV-1a hash used for snapshot spreading.
+`RemoveSymbols` emits an empty retirement snapshot before removing state,
+so a downstream reader can tell "book closed" apart from "book still open,
+we just stopped."
 
-`handle(msg)`:
-- `Feed` → dispatch each event.
-- `ConnUp` → mark up, mark all this-connection replicas as `synced =
-  false` (fresh subscription implied).
-- `ConnDown` → mark down, drop replica sync, reselect source if it was
-  the source. Does **not** drop the book Arc — the connection reuses it.
-- `Register` → store book manager + command sender.
-- `AddSymbols` → create `SymbolState`, cache `snapshot_hash` (FNV-1a).
-- `RemoveSymbols` → if the symbol had a source, emit an **empty retirement
-  snapshot**, then remove.
+`handle_event` handles the three event kinds. `Snapshot` marks the replica
+synced, re-emits if the replica is the source, and tries source selection
+if the replica is a backup and there's no eligible source. `Delta` updates
+the connection's latency EWMA and, if the replica is the source, updates
+`mean_gap`, writes `Output::Update`, and tries source selection if there's
+no source yet. `Desync` marks the replica unsynced, sets
+`resubscribe_pending`, resubscribes, and reselects if it was the source.
 
-`handle_event`:
-- `Snapshot` → mark replica synced; if source, re-emit; if backup and no
-  eligible source, `select_source`.
-- `Delta` → update latency EWMA; if source, update `mean_gap` and write
-  `Output::Update`; if backup and `source.is_none()`, `select_source`.
-- `Desync` → unsync, set `resubscribe_pending`, `resubscribe`, reselect
-  source if it was the source.
+`tick` runs at 250ms granularity. Every second it calls `check_health`,
+which collects desyncs, resubscribes, reselections, and uncovered symbols
+in a single scan, then applies them all afterwards so a symbol can't be
+affected mid-scan. Every `snapshot_interval` it bumps `next_snapshot` and
+emits `Rotate` if a file rotation is due. Every tick it calls
+`spread_snapshots`. Every `stats_interval` it logs the summary line.
 
-`tick(now, wall, queue_len)`:
-- Every 1s: `check_health` — collect desyncs/resubscribes/reselections/
-  uncovered in one scan, apply after so a symbol can't be affected
-  mid-scan.
-- Every snapshot_interval: bump `next_snapshot`, emit `Rotate` if due.
-- Every tick: `spread_snapshots`.
-- Every stats_interval: log summary.
-
-Counter design: `updates_written` = source deltas = writer updates;
-`snapshots_written` = every Snapshot (periodic + switch + retirement) =
-writer snapshots. Both equalities hold at shutdown — that's the pipeline
-proof.
-
+The counters are deliberately split so that `updates_written` equals the
+number of source deltas equals the writer's update count, and
+`snapshots_written` equals every `Output::Snapshot` (periodic, source
+switch, retirement) equals the writer's snapshot count. Both equalities are
+what proves the pipeline at shutdown.
 ## Usage
 
 ### Build
